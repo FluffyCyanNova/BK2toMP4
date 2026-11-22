@@ -5,6 +5,8 @@ Batch-convert .bk2 (Bink 2) files to .mp4 using RAD Video Tools silently.
 Requires: RAD Video Tools installed at C:\\Program Files (x86)\\RADVideo\\
           (or pass --rad <path>).
 
+By FluffyCyanNova and Claude (Anthropic).
+
 Usage:
     python bk2_to_mp4.py <input_dir> [output_dir] [--workers N] [--rad PATH]
 

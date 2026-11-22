@@ -11,6 +11,8 @@ valid Bink streams are extracted.
 Algorithm ported from the clean-room C# implementation in
 https://github.com/breadbbbb/rpf9-explorer (Core/Rpf9MediaRecovery.cs).
 
+Python port by FluffyCyanNova and Claude (Anthropic).
+
 Usage:
     python extract_bink.py <input.rpf> <output_dir> [--list]
 """
