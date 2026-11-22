@@ -12,16 +12,19 @@ Behaviour:
     - Recursively finds *.bk2 under input_dir (non-recursive by default; add --recursive).
     - Writes <basename>.mp4 next to input, or into output_dir if given.
     - Skips files whose .mp4 already exists (resumable).
-    - Uses radvideo64.exe BinkConv ... /AutoClose with hidden window.
+    - Uses radvideo64.exe BinkConv ... /AutoClose on an invisible desktop, so it cannot take focus.
+    - Pads odd widths/heights by one black pixel (H.264 needs even sizes).
     - Prints a live progress line with ETA.
 """
 import argparse
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,8 +34,152 @@ def _visible_len(s: str) -> int:
     """Length of `s` as it will appear on screen (ignores ANSI colour codes)."""
     return len(_ANSI_RE.sub("", s))
 
+
 DEFAULT_RAD = r"C:\Program Files (x86)\RADVideo\radvideo64.exe"
-CREATE_NO_WINDOW = 0x08000000  # suppresses console window on Windows
+POLL_INTERVAL   = 0.1     # seconds between polls
+NO_OUTPUT_GRACE = 30.0    # seconds to wait for the output file to appear
+STALL_LIMIT     = 60.0    # seconds without output growth
+HARD_TIMEOUT    = 1800.0  # absolute cap on a single conversion
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as W
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _u32 = ctypes.WinDLL("user32", use_last_error=True)
+    _ENUMPROC = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+
+    class _StartupInfo(ctypes.Structure):
+        _fields_ = (
+            [("cb", W.DWORD), ("reserved", W.LPWSTR), ("desktop", W.LPWSTR), ("title", W.LPWSTR)]
+            + [(n, W.DWORD) for n in "x y xsize ysize xchars ychars fill flags".split()]
+            + [("show", W.WORD), ("cb2", W.WORD), ("reserved2", ctypes.c_void_p),
+               ("stdin", W.HANDLE), ("stdout", W.HANDLE), ("stderr", W.HANDLE)]
+        )
+
+    class _ProcessInfo(ctypes.Structure):
+        _fields_ = [("process", W.HANDLE), ("thread", W.HANDLE), ("pid", W.DWORD), ("tid", W.DWORD)]
+
+    for _dll, _name, _ret, *_args in (
+        (_u32, "CreateDesktopW", W.HANDLE, W.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p, W.DWORD, W.DWORD, ctypes.c_void_p),
+        (_u32, "CloseDesktop", W.BOOL, W.HANDLE),
+        (_u32, "EnumDesktopWindows", W.BOOL, W.HANDLE, _ENUMPROC, W.LPARAM),
+        (_u32, "GetClassNameW", ctypes.c_int, W.HWND, W.LPWSTR, ctypes.c_int),
+        (_k32, "CreateJobObjectW", W.HANDLE, ctypes.c_void_p, W.LPCWSTR),
+        (_k32, "SetInformationJobObject", W.BOOL, W.HANDLE, ctypes.c_int, ctypes.c_void_p, W.DWORD),
+        (_k32, "AssignProcessToJobObject", W.BOOL, W.HANDLE, W.HANDLE),
+        (_k32, "CreateProcessW", W.BOOL, W.LPCWSTR, W.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+         W.BOOL, W.DWORD, ctypes.c_void_p, W.LPCWSTR, ctypes.c_void_p, ctypes.c_void_p),
+        (_k32, "ResumeThread", W.DWORD, W.HANDLE),
+        (_k32, "WaitForSingleObject", W.DWORD, W.HANDLE, W.DWORD),
+        (_k32, "GetExitCodeProcess", W.BOOL, W.HANDLE, ctypes.POINTER(W.DWORD)),
+        (_k32, "TerminateProcess", W.BOOL, W.HANDLE, W.UINT),
+        (_k32, "CloseHandle", W.BOOL, W.HANDLE),
+    ):
+        getattr(_dll, _name).restype = _ret
+        getattr(_dll, _name).argtypes = _args
+
+
+class OffscreenProcess:
+    """A process on its own desktop, so it cannot take focus, that dies with this script."""
+
+    def __init__(self, argv: list[str]):
+        self.desktop = self.job = None
+        self.info = _ProcessInfo()
+        self.argv = argv
+
+    def __enter__(self):
+        try:
+            self._start()
+        except BaseException:
+            self.__exit__()
+            raise
+        return self
+
+    def _start(self) -> None:
+        name = "bk2mp4_" + uuid.uuid4().hex
+        self.desktop = _u32.CreateDesktopW(name, None, None, 0, 0x10000000, None)  # GENERIC_ALL
+        self.job = _k32.CreateJobObjectW(None, None)
+        if not self.desktop or not self.job:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = (ctypes.c_ubyte * (144 if ctypes.sizeof(ctypes.c_void_p) == 8 else 112))()
+        ctypes.c_uint32.from_buffer(limits, 16).value = 0x2000  # KILL_ON_JOB_CLOSE
+        if not _k32.SetInformationJobObject(self.job, 9, limits, len(limits)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        si = _StartupInfo(cb=ctypes.sizeof(_StartupInfo), desktop=name)
+        cmd = ctypes.create_unicode_buffer(subprocess.list2cmdline(self.argv))
+        if not _k32.CreateProcessW(None, cmd, None, None, False, 0x4, None, None,  # CREATE_SUSPENDED
+                                   ctypes.byref(si), ctypes.byref(self.info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not _k32.AssignProcessToJobObject(self.job, self.info.process):
+            raise ctypes.WinError(ctypes.get_last_error())
+        _k32.ResumeThread(self.info.thread)
+
+    def poll(self) -> int | None:
+        if _k32.WaitForSingleObject(self.info.process, 0) != 0:
+            return None
+        code = W.DWORD()
+        _k32.GetExitCodeProcess(self.info.process, ctypes.byref(code))
+        return code.value
+
+    def has_message_box(self) -> bool:
+        found = []
+
+        def check(hwnd, _):
+            buf = ctypes.create_unicode_buffer(64)
+            _u32.GetClassNameW(hwnd, buf, len(buf))
+            if buf.value in ("RADTextBox", "#32770"):
+                found.append(hwnd)
+            return True
+
+        _u32.EnumDesktopWindows(self.desktop, _ENUMPROC(check), 0)
+        return bool(found)
+
+    def __exit__(self, *_):
+        if self.info.process:
+            _k32.TerminateProcess(self.info.process, 1)
+            _k32.WaitForSingleObject(self.info.process, 5000)
+        for handle in (self.info.thread, self.info.process, self.job):
+            if handle:
+                _k32.CloseHandle(handle)
+        if self.desktop:
+            _u32.CloseDesktop(self.desktop)
+
+
+def even_size_args(src: Path) -> list[str]:
+    with src.open("rb") as f:
+        header = f.read(28)
+    if len(header) < 28:
+        return []
+    w, h = struct.unpack_from("<II", header, 20)
+    if w % 2 == 0 and h % 2 == 0:
+        return []
+    return [f"/Pad{w + 1 if w % 2 else 0},{h + 1 if h % 2 else 0}"]
+
+
+def first_track_args(src: Path) -> list[str]:
+    """/InputTrack takes a track ID, and the first track's ID isn't always 0."""
+    with src.open("rb") as f:
+        header = f.read(44)
+        if len(header) < 44:
+            return []
+        tracks = struct.unpack_from("<I", header, 40)[0]
+        if not 0 < tracks <= 256:
+            return []
+        # KB2i and later have an extra 4-byte field before the three track tables.
+        base = 48 if header[:3] == b"KB2" and header[3] >= ord("i") else 44
+        f.seek(base + 8 * tracks)
+        raw = f.read(4)
+    if len(raw) < 4:
+        return []
+    track_id = struct.unpack("<I", raw)[0]
+    return [f"/InputTrack{track_id}"] if track_id else []
+
+
+# Redirected output can use a legacy code page that lacks the symbols we print.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
 
 # --- Colors ------------------------------------------------------------------
 # Windows 11 terminals handle ANSI natively. Enable VT processing just in case.
@@ -110,33 +257,47 @@ def convert_one(rad: str, src: Path, dst: Path) -> tuple[Path, bool, str]:
     """Convert a single .bk2 to .mp4. Returns (src, success, message)."""
     if dst.exists() and dst.stat().st_size > 0:
         return src, True, "skipped (exists)"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    # BinkConv: input output /AutoClose — closes the "Done!" dialog on completion.
-    # CREATE_NO_WINDOW keeps the RAD GUI hidden.
-    # Temp name must keep the real extension at the end — BinkConv picks the
-    # output format from the extension and rejects anything it doesn't know.
-    tmp = dst.with_name(dst.stem + ".tmp" + dst.suffix)
-    if tmp.exists():
-        tmp.unlink()
+    # BinkConv picks the format from the extension, so it must stay last. The
+    # random part means we only ever remove a temp file this call created.
+    tmp = dst.with_name(f"{dst.stem}.{uuid.uuid4().hex[:8]}.tmp{dst.suffix}")
+    error = None
     try:
-        proc = subprocess.run(
-            [rad, "BinkConv", str(src), str(tmp), "/AutoClose"],
-            creationflags=CREATE_NO_WINDOW,
-            capture_output=True,
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        argv = [rad, "BinkConv", str(src), str(tmp), *even_size_args(src),
+                *first_track_args(src), "/AutoClose"]
+        with OffscreenProcess(argv) as proc:
+            started = changed = time.monotonic()
+            last_size = 0
+            while (code := proc.poll()) is None:
+                now = time.monotonic()
+                size = tmp.stat().st_size if tmp.exists() else 0
+                if size != last_size:
+                    last_size, changed = size, now
+                if proc.has_message_box():
+                    error = "BinkConv showed an error"
+                elif not size and now - started > NO_OUTPUT_GRACE:
+                    error = f"no output after {NO_OUTPUT_GRACE:.0f}s"
+                elif size and now - changed > STALL_LIMIT:
+                    error = f"output stalled for {STALL_LIMIT:.0f}s"
+                elif now - started > HARD_TIMEOUT:
+                    error = f"hard timeout (>{HARD_TIMEOUT:.0f}s)"
+                if error:
+                    return src, False, error
+                time.sleep(POLL_INTERVAL)
+        if code:
+            return src, False, f"exit {code}"
+        if not tmp.exists() or not tmp.stat().st_size:
+            return src, False, "no output produced"
+        tmp.rename(dst)
+        return src, True, f"ok ({fmt_bytes(dst.stat().st_size)})"
+    except OSError as e:
+        return src, False, str(e)
+    finally:
         if tmp.exists():
-            tmp.unlink()
-        return src, False, "timeout (>600s)"
-    if proc.returncode != 0:
-        if tmp.exists():
-            tmp.unlink()
-        return src, False, f"exit {proc.returncode}"
-    if not tmp.exists() or tmp.stat().st_size == 0:
-        return src, False, "no output produced"
-    tmp.rename(dst)
-    return src, True, f"ok ({fmt_bytes(dst.stat().st_size)})"
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def ask(prompt: str, default: str = "") -> str:

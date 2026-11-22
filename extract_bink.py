@@ -27,6 +27,11 @@ MAX_FRAMES = 1_000_000
 READ_BUDGET = 64 * 1024 * 1024
 MAX_CONSECUTIVE_ZERO_PAGES = 256
 
+# Redirected output can use a legacy code page that lacks the symbols we print.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
 # --- Colors ------------------------------------------------------------------
 if os.name == "nt":
     try:

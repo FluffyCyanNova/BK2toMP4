@@ -17,14 +17,13 @@ extract_bink.py  Carve Bink streams out of an RPF9 archive (optional).
 
 These scripts process files you already have. **Bring your own input.** Do not
 use this repo to distribute, trade, or redistribute copyrighted content. No
-third-party data is included here and none should ever be committed to a fork
-of this repo. The `.gitignore` is set up to reject common media and archive
-extensions so this can't happen by accident.
+third-party media or game data is included here and none should ever be
+committed to a fork of this repo. The `.gitignore` excludes common media and
+archive extensions, but check what you stage.
 
 The Bink codec is proprietary and owned by [RAD Game Tools](https://www.radgametools.com/)
-(part of Epic Games). `bk2_to_mp4.py` drives their free RAD Video Tools
-installer at `C:\Program Files (x86)\RADVideo\radvideo64.exe`. This repo does
-not ship or redistribute any part of Bink.
+(part of Epic Games). `bk2_to_mp4.py` drives their free RAD Video Tools, which
+you install yourself. This repo does not ship or redistribute any part of Bink.
 
 ---
 
@@ -32,11 +31,11 @@ not ship or redistribute any part of Bink.
 
 | Script | OS | Dependencies |
 |---|---|---|
-| `extract_bink.py` | Any | Python 3.10+ (stdlib only — no `pip install`) |
-| `bk2_to_mp4.py`   | Windows 10 / 11 | Python 3.10+ **and** [RAD Video Tools](https://www.radgametools.com/down/Bink/RADTools.exe) |
+| `extract_bink.py` | Any (tested on Windows) | Python 3.10+ (stdlib only — no `pip install`) |
+| `bk2_to_mp4.py`   | Windows 10 / 11 (tested on 11) | Python 3.10+ **and** [RAD Video Tools](https://www.radgametools.com/down/Bink/RADTools.exe) |
 
 RAD Video Tools is a free ~1.3 MB installer signed by Epic Games Inc. Install
-with defaults — the scripts expect it at `C:\Program Files (x86)\RADVideo\radvideo64.exe`.
+with defaults — the converter expects it at `C:\Program Files (x86)\RADVideo\radvideo64.exe`.
 If you install it somewhere else, pass `--rad "C:\path\to\radvideo64.exe"`
 when running `bk2_to_mp4.py`.
 
@@ -72,43 +71,63 @@ python bk2_to_mp4.py
 Or drive it from the command line:
 
 ```powershell
-python bk2_to_mp4.py <input_dir> [output_dir] [--recursive] [--workers N] [--dry-run]
+python bk2_to_mp4.py <input_dir> [output_dir] [--recursive] [--workers N] [--dry-run] [--rad PATH]
 ```
 
 | flag | meaning |
 |---|---|
 | `<input_dir>` | folder containing `*.bk2` files |
-| `[output_dir]` | where to write `*.mp4` (default: `<input_dir>_mp4` sibling) |
+| `[output_dir]` | where to write `*.mp4`. Default: `<input_dir>` itself on the command line; the menu suggests `<input_dir>_mp4` |
 | `--recursive` | descend into subdirectories |
-| `--workers N` | parallel converter processes (default 1; RAD's GUI may not love >1) |
-| `--dry-run` | list files, don't convert |
+| `--workers N` | conversions to run at the same time (default 1). More uses more CPU and memory |
+| `--dry-run` | list files; in a terminal, then asks whether to convert |
 | `--rad PATH` | override the path to `radvideo64.exe` |
 
 The script:
 
-- skips files whose `.mp4` already exists (resumable);
-- writes to a `.mp4.part` temp file and renames on success (no half-files);
-- uses `BinkConv ... /AutoClose` with a hidden window so you never see a RAD
-  dialog or have to click anything.
+- **converts straight to MP4** (H.264 + AAC), with no AVI in between;
+- **stays out of your way**: RAD runs on a separate invisible Windows desktop,
+  so its windows can't appear on screen or take keyboard focus;
+- **resumes**: files whose `.mp4` already exists are skipped;
+- **leaves no half-files under the final name**: it writes to
+  `<name>.<random>.tmp.mp4` and renames on success;
+- **pads odd sizes**: H.264 needs an even width and height, so an odd one gets
+  a single black row or column (for example 1635×720 becomes 1636×720);
+- **picks the first audio track by its ID**, which isn't always 0;
+- **fails fast**: a RAD error box fails that file and the batch moves on. The
+  exit code is 1 if any file failed.
+
+#### Limitations
+
+- Each MP4 holds only the **first audio track** of a multi-track file.
+- Only `.bk2` files are picked up, not Bink 1 `.bik`.
+- A run that is force-killed can leave a `*.tmp.mp4` behind. It is incomplete
+  and safe to delete once nothing is converting.
 
 ### extract_bink.py — carve Bink streams from an RPF9
 
-For `RPF9` archives whose directory tables are AES-CBC encrypted and whose
-key is not public. Bink streams inside such archives are stored as plain
-data, so a scan + header validation finds them reliably.
+For `RPF9` archives whose directory table is encrypted, but whose Bink streams
+are stored as plain data. It doesn't decrypt anything.
 
 ```powershell
-python extract_bink.py <input.rpf> [output_dir] [--list]
+python extract_bink.py <input.rpf> <output_dir>
+python extract_bink.py <input.rpf> --list
 ```
 
 Produces files named `clip_<index>_at_<offset_hex>.bk2` (and `.bik` for Bink 1).
 
-Only strictly valid Bink files are carved: the header is parsed, dimensions
-and frame rate are range-checked, and the frame index table must be
-monotonically increasing and sum to exactly the file length. False positives
-from random magic-byte collisions are rejected.
+Each stream is validated before it is written: dimensions and frame rate are
+range-checked, and the frame index table must increase steadily and end at
+exactly the file length.
 
-Then feed that output directory into `bk2_to_mp4.py`.
+#### Limitations
+
+- It is meant for archives made up of **consecutive Bink streams**. It starts
+  right after the archive metadata and stops at the first data that is neither
+  Bink nor zero padding, so it won't find videos mixed in with other assets.
+- Original file names are not recovered.
+- It reads at most 64 MB of headers and index tables per archive, so a very
+  large archive may be listed only partly.
 
 ---
 
@@ -122,16 +141,15 @@ python extract_bink.py "D:\path\to\your_archive.rpf" "D:\out\clips_bk2"
 python bk2_to_mp4.py "D:\out\clips_bk2" "D:\out\clips_mp4"
 ```
 
-A 2560×1440, 13-second Bink 2 clip converts in a few seconds and comes out
-around 55 MB as H.264 + AAC. Silent clips with no audio tracks work the same
-way; `BinkConv` just writes a video-only MP4.
+Expect the MP4s to be about 4 times the size of the `.bk2` files. Clips with
+no audio tracks become video-only MP4s.
 
 ---
 
 ## Credits
 
-- The Bink-recovery algorithm in `extract_bink.py` is a Python port of the
-  clean-room C# implementation in
+- The Bink-recovery algorithm in `extract_bink.py` is a Python port of the C#
+  implementation in
   [breadbbbb/rpf9-explorer](https://github.com/breadbbbb/rpf9-explorer)
   (`Core/Rpf9MediaRecovery.cs`). Credit for the heuristics belongs there.
 - The MP4 conversion is done by [RAD Video Tools](https://www.radgametools.com/)
@@ -142,6 +160,9 @@ way; `BinkConv` just writes a video-only MP4.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). This applies to the scripts in this repo only;
-Bink Video and RAD Video Tools have their own licenses, and third-party
-content is not covered.
+[MIT](LICENSE) covers `bk2_to_mp4.py` and this documentation.
+
+It does **not** cover `extract_bink.py`: that file is derived from
+rpf9-explorer, which publishes no license for its code, so no permission to
+reuse it can be granted here. Bink Video and RAD Video Tools have their own
+licenses.
