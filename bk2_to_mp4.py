@@ -106,7 +106,9 @@ def convert_one(rad: str, src: Path, dst: Path) -> tuple[Path, bool, str]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     # BinkConv: input output /AutoClose — closes the "Done!" dialog on completion.
     # CREATE_NO_WINDOW keeps the RAD GUI hidden.
-    tmp = dst.with_suffix(".mp4.part")
+    # Temp name must keep the real extension at the end — BinkConv picks the
+    # output format from the extension and rejects anything it doesn't know.
+    tmp = dst.with_name(dst.stem + ".tmp" + dst.suffix)
     if tmp.exists():
         tmp.unlink()
     try:
