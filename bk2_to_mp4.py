@@ -17,12 +17,19 @@ Behaviour:
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def _visible_len(s: str) -> int:
+    """Length of `s` as it will appear on screen (ignores ANSI colour codes)."""
+    return len(_ANSI_RE.sub("", s))
 
 DEFAULT_RAD = r"C:\Program Files (x86)\RADVideo\radvideo64.exe"
 CREATE_NO_WINDOW = 0x08000000  # suppresses console window on Windows
@@ -264,15 +271,29 @@ def main() -> int:
         frac = done_bytes / total_bytes if total_bytes else 1.0
         pct = 100 * frac
         term_w = shutil.get_terminal_size((100, 20)).columns
-        bar_w = max(20, min(44, term_w - 60))
-        bar = make_bar(frac, bar_w)
-        line = (
-            f"\r  {bar}  {ACCENT}{pct:5.1f}%{RESET}  "
+        stats = (
+            f"  {ACCENT}{pct:5.1f}%{RESET}  "
             f"{SOFT}{done}{MUTE}/{len(pending)}{RESET}  "
             f"{MUTE}·{RESET}  {ACC2}{fmt_bytes(rate)}/s{RESET}  "
             f"{MUTE}·{RESET}  {SOFT}eta {fmt_time(eta)}{RESET}"
         )
-        sys.stdout.write(line + " " * 6)
+        # Budget what's left after "  " indent + stats, cap bar at 44.
+        bar_w = max(8, min(44, term_w - _visible_len(stats) - 4))
+        bar = make_bar(frac, bar_w)
+        line = f"  {bar}{stats}"
+        # If still over-wide (tiny terminal, long ETA strings), hard-trim.
+        over = _visible_len(line) - (term_w - 1)
+        if over > 0:
+            # Trim from the end of the visible text (keeping ANSI codes intact
+            # is messy; simplest is to drop stats from the end).
+            visible = _ANSI_RE.sub("", line)[: max(0, term_w - 1)]
+            line = visible + RESET
+        # On a real terminal: \033[2K clears the current row entirely, \r
+        # returns the cursor to column 0 — redraws cleanly even if the previous
+        # line was wider. When stdout is piped (no tty), skip ANSI so the pipe
+        # output stays readable.
+        prefix = "\033[2K\r" if USE_COLOR else "\r"
+        sys.stdout.write(prefix + line)
         sys.stdout.flush()
 
     print(f"  {MUTE}converting{RESET}")
